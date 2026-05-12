@@ -1,29 +1,3 @@
-## 🟠 Security / Correctness
-
-### 4. Hash input is unstructured string concatenation
-`show index ++ timestamp ++ dat ++ prevHash ++ show nonce` can collide (e.g. index `12`, data `"3foo"` vs index `1`, data `"23foo"`). Use a **canonical serialisation** like `binary`, `cereal`, or CBOR:
-
-```haskell
-import Data.Binary (encode)
--- or use a length-prefixed format
-```
-
-### 5. `Hash = String` — use `newtype` over `ByteString`
-`String` is a list of `Char` (very slow). Store hashes as raw `ByteString` or `Digest SHA256`:
-
-```haskell
-import Crypto.Hash (Digest, SHA256, hash)
-newtype BlockHash = BlockHash (Digest SHA256) deriving (Show, Eq)
-```
-
-### 6. No replay protection / no Merkle tree
-`blockData :: String` means only one transaction per block. Production chains use a **Merkle tree** of transactions for efficient verification and SPV proofs.
-
-### 7. Timestamp is not validated
-A block's timestamp should be checked to be ≥ previous block's timestamp and not too far in the future (to prevent time-warp attacks).
-
----
-
 ## 🟡 Architecture
 
 ### 8. Missing error handling — no `Either`/`ExceptT`
@@ -71,26 +45,3 @@ prop_validChainAfterAdd txs = monadicIO $ do
   chain <- run $ buildChain txs
   assert (isValidChain chain)
 ```
-
-### 15. Minor bugs in `Main.hs`
-- Block 2 is added to `chain1` not `chain2` (typo creates a fork)
-- `isValidChain chain2` validates the wrong (shorter) chain — should be `chain3`
-
----
-
-## Suggested Stack for Production
-
-| Concern | Library |
-|---|---|
-| Hashing | `cryptonite` |
-| Serialisation | `binary` / `aeson` |
-| Concurrency | `async` + `stm` |
-| Persistence | `sqlite-simple` |
-| Logging | `katip` |
-| CLI config | `optparse-applicative` |
-| Testing | `hspec` + `QuickCheck` |
-| Networking | `conduit-network` |
-
----
-
-The two most impactful immediate fixes are **#11** (re-derive hashes in validation — it's a correctness bug) and **#4** (canonical serialisation — it's a security bug). Everything else layers on top of a correct foundation.

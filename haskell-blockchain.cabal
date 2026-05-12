@@ -53,7 +53,7 @@ extra-doc-files:    CHANGELOG.md
 common warnings
     ghc-options: -Wall
 
-executable automatic-invention
+executable haskell-blockchain
     -- Import common warning flags.
     import:           warnings
 
@@ -61,21 +61,24 @@ executable automatic-invention
     main-is:          Main.hs
 
     -- Modules included in this executable, other than Main.
-    other-modules:    Blockchain
+    other-modules:    Blockchain,
+                      Transaction,
+                      MerkleTree
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
 
     -- Other library packages from which modules are imported.
     build-depends:    base >= 4.7 && < 5 ,
-                      cryptohash-sha256,
+                      cryptonite,
                       bytestring,
                       base16-bytestring,
                       time,
                       aeson,
                       containers >= 0.8,
                       stm >= 2.5,
-                      async >= 2.2
+                      async >= 2.2,
+                      binary >= 0.8
 
     -- Directories containing source files.
     hs-source-dirs:   src

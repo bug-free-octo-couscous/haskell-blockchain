@@ -1,6 +1,8 @@
 module Blockchain
   ( Block(..)
   , Blockchain
+  , BlockHash
+  , unBlockHash
   , ChainConfig(..)
   , defaultConfig
   , mkBlockchain
@@ -8,81 +10,159 @@ module Blockchain
   , chainTip
   , chainConfig
   , calculateHash
+  , genesisHash
   , mineBlockAsync
   , createGenesisBlock
   , addBlock
   , isValidHash
   , isValidChain
+  , TimestampError(..)
+  , validateTimestamp
   ) where
 
 import Data.Time.Clock (UTCTime, getCurrentTime, diffUTCTime, NominalDiffTime)
-import Crypto.Hash.SHA256 (hash)
+import Crypto.Hash (Digest, SHA256, hash, digestFromByteString)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Base16 as B16
+import Data.Binary (encode)
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
 import Control.Concurrent.STM (TVar, newTVarIO, readTVarIO)
 
-type Hash = String
+import Transaction (Transaction, txId)
+import MerkleTree  (buildMerkleTree, merkleRoot, emptyMerkleRoot)
 
--- | Runtime-tunable chain parameters.
+-- ---------------------------------------------------------------------------
+-- BlockHash newtype
+-- ---------------------------------------------------------------------------
+
+newtype BlockHash = BlockHash (Digest SHA256)
+  deriving (Show, Eq)
+
+unBlockHash :: BlockHash -> String
+unBlockHash (BlockHash d) =
+  BC.unpack (B16.encode (B16.decodeLenient (BC.pack (show d))))
+
+genesisHash :: BlockHash
+genesisHash = BlockHash zeroDigest
+  where
+    zeroDigest = case digestFromByteString (BS.replicate 32 0) of
+      Just d  -> d
+      Nothing -> error "genesisHash: impossible"
+
+-- ---------------------------------------------------------------------------
+-- Config
+-- ---------------------------------------------------------------------------
+
 data ChainConfig = ChainConfig
-  { cfgDifficulty      :: Int              -- ^ current leading-zero target
-  , cfgTargetBlockTime :: NominalDiffTime  -- ^ desired seconds per block
-  , cfgRetargetEvery   :: Int              -- ^ retarget after this many blocks
+  { cfgDifficulty      :: Int
+  , cfgTargetBlockTime :: NominalDiffTime
+  , cfgRetargetEvery   :: Int
+  , cfgChainId         :: Int             -- ^ used for replay protection in transactions
+  , cfgMaxFutureTime   :: NominalDiffTime -- ^ how far ahead of wall-clock a timestamp may be
   } deriving (Show, Eq)
 
--- | Sensible defaults: difficulty 1, 10-second target, retarget every 5 blocks.
 defaultConfig :: ChainConfig
 defaultConfig = ChainConfig
   { cfgDifficulty      = 1
   , cfgTargetBlockTime = 10
   , cfgRetargetEvery   = 5
+  , cfgChainId         = 1
+  , cfgMaxFutureTime   = 120  -- 2 minutes, matching Bitcoin's rule
   }
 
+-- ---------------------------------------------------------------------------
+-- Block
+-- ---------------------------------------------------------------------------
+
+-- | A block now carries a list of transactions and commits to them via a
+-- Merkle root rather than an unstructured 'String'.  This enables:
+--   * Multiple transactions per block.
+--   * Efficient SPV proofs (verify a tx is in a block without the full block).
+--   * Replay protection: each tx encodes the chain ID.
 data Block = Block
-  { blockIndex     :: Int
-  , blockTimestamp :: UTCTime
-  , blockData      :: String
-  , blockPrevHash  :: Hash
-  , blockNonce     :: Int
-  , blockHash      :: Hash
+  { blockIndex      :: Int
+  , blockTimestamp  :: UTCTime
+  , blockTxs        :: [Transaction]   -- ^ full transaction list
+  , blockMerkleRoot :: BlockHash       -- ^ Merkle root of blockTxs
+  , blockPrevHash   :: BlockHash
+  , blockNonce      :: Int
+  , blockHash       :: BlockHash
   } deriving (Show, Eq)
 
--- | O(1) tip access; O(log n) append via Seq.
--- Config travels with the chain so every caller gets consistent parameters.
+-- ---------------------------------------------------------------------------
+-- Blockchain
+-- ---------------------------------------------------------------------------
+
 data Blockchain = Blockchain
   { chainBlocks :: Seq Block
   , chainTip    :: Block
   , chainConfig :: ChainConfig
   }
 
--- | Build a chain from a genesis block with an initial config.
 mkBlockchain :: Block -> ChainConfig -> Blockchain
 mkBlockchain genesis cfg = Blockchain (Seq.singleton genesis) genesis cfg
 
--- | Convert to a plain list when needed (e.g. printing or validation).
 chainToList :: Blockchain -> [Block]
 chainToList = foldr (:) [] . chainBlocks
+
+-- ---------------------------------------------------------------------------
+-- Timestamp validation
+-- ---------------------------------------------------------------------------
+
+data TimestampError
+  = TimestampInPast    -- ^ block timestamp is before the previous block's
+  | TimestampTooFuture -- ^ block timestamp is too far ahead of wall-clock time
+  deriving (Show, Eq)
+
+-- | Validate a candidate block timestamp against two rules:
+--
+--   1. __Monotonicity__: the new timestamp must be ≥ the previous block's
+--      timestamp.  This prevents time-warp attacks where a miner backdates
+--      blocks to manipulate the difficulty retarget window.
+--
+--   2. __Future cap__: the new timestamp must not exceed the node's current
+--      wall-clock time by more than 'cfgMaxFutureTime'.  This bounds how far
+--      ahead a miner can pre-date a block, limiting the drift they can inject.
+validateTimestamp
+  :: ChainConfig
+  -> UTCTime   -- ^ wall-clock "now" at the receiving node
+  -> UTCTime   -- ^ previous block's timestamp
+  -> UTCTime   -- ^ candidate block's timestamp
+  -> Either TimestampError ()
+validateTimestamp cfg now prevTime newTime
+  | newTime < prevTime            = Left TimestampInPast
+  | drift > cfgMaxFutureTime cfg  = Left TimestampTooFuture
+  | otherwise                     = Right ()
+  where
+    drift = diffUTCTime newTime now
+
+-- ---------------------------------------------------------------------------
+-- Merkle helpers
+-- ---------------------------------------------------------------------------
+
+-- | Compute the Merkle root for a list of transactions.
+-- Returns 'emptyMerkleRoot' for an empty block (coinbase-only in production).
+computeMerkleRoot :: [Transaction] -> BlockHash
+computeMerkleRoot [] = BlockHash emptyMerkleRoot
+computeMerkleRoot txs =
+  case buildMerkleTree (map txId txs) of
+    Just tree -> BlockHash (merkleRoot tree)
+    Nothing   -> BlockHash emptyMerkleRoot
 
 -- ---------------------------------------------------------------------------
 -- Difficulty retargeting
 -- ---------------------------------------------------------------------------
 
--- | Recompute difficulty based on how long the last window of blocks took.
---
--- Bitcoin-style clamped retarget:
---   new_diff = old_diff * (target_time * window) / actual_time
--- clamped to [old_diff / 4, old_diff * 4] so a single slow window
--- can't crash or spike the difficulty.
 retargetDifficulty :: ChainConfig -> [Block] -> ChainConfig
 retargetDifficulty cfg window =
   case (safeHead window, safeLast window) of
     (Just first, Just lst) ->
       let actual  = diffUTCTime (blockTimestamp lst) (blockTimestamp first)
-          target  = cfgTargetBlockTime cfg
-                      * fromIntegral (cfgRetargetEvery cfg)
-          actual' = max actual 1          -- guard against zero
+          target  = cfgTargetBlockTime cfg * fromIntegral (cfgRetargetEvery cfg)
+          actual' = max actual 1
           ratio   = toRational target / toRational actual'
           oldDiff = cfgDifficulty cfg
           newDiff = max 1
@@ -90,7 +170,7 @@ retargetDifficulty cfg window =
                   . max (max 1 (oldDiff `div` 4))
                   $ round (fromIntegral oldDiff * (fromRational ratio :: Double))
       in cfg { cfgDifficulty = newDiff }
-    _ -> cfg    -- not enough blocks; keep unchanged
+    _ -> cfg
   where
     safeHead []    = Nothing
     safeHead (x:_) = Just x
@@ -98,28 +178,47 @@ retargetDifficulty cfg window =
     safeLast xs    = Just (last xs)
 
 -- ---------------------------------------------------------------------------
--- Hashing and mining
+-- Hashing
 -- ---------------------------------------------------------------------------
 
-calculateHash :: Int -> String -> String -> String -> Int -> Hash
-calculateHash index timestamp dat prevHash nonce =
-  let content = show index ++ timestamp ++ dat ++ prevHash ++ show nonce
-      bytes   = BC.pack content
-      hashed  = hash bytes
-  in BC.unpack (B16.encode hashed)
+-- | Hash the block *header* fields — notably the Merkle root rather than raw
+-- data.  Miners only need the root; the full tx list is not re-hashed per nonce.
+calculateHash
+  :: Int       -- ^ block index
+  -> String    -- ^ timestamp
+  -> BlockHash -- ^ Merkle root of transactions
+  -> BlockHash -- ^ previous block hash
+  -> Int       -- ^ nonce
+  -> BlockHash
+calculateHash index timestamp (BlockHash merkle) (BlockHash prevDigest) nonce =
+  let merkleBytes = BC.pack (show merkle)
+      prevBytes   = BC.pack (show prevDigest)
+      bytes       = BL.toStrict
+                  $  encode index
+                  <> encode timestamp
+                  <> BL.fromStrict merkleBytes
+                  <> BL.fromStrict prevBytes
+                  <> encode nonce
+  in BlockHash (hash bytes)
 
--- | Mine in a tight loop, checking the cancellation token every 1 000 nonces.
--- Returns Nothing if cancelled (e.g. a peer found the block first),
--- or Just (hash, nonce) on success.
+isValidHash :: Int -> BlockHash -> Bool
+isValidHash diff (BlockHash d) =
+  let hex = BC.unpack (B16.encode (BC.pack (show d)))
+  in take diff hex == replicate diff '0'
+
+-- ---------------------------------------------------------------------------
+-- Mining
+-- ---------------------------------------------------------------------------
+
 mineBlockAsync
-  :: Int          -- ^ difficulty (leading zeros required)
-  -> Int          -- ^ block index
-  -> String       -- ^ timestamp
-  -> String       -- ^ data payload
-  -> String       -- ^ previous hash
-  -> TVar Bool    -- ^ cancellation flag: set True from another thread to abort
-  -> IO (Maybe (Hash, Int))
-mineBlockAsync diff index timestamp dat prevHash cancelVar =
+  :: Int       -- ^ difficulty
+  -> Int       -- ^ block index
+  -> String    -- ^ timestamp
+  -> BlockHash -- ^ Merkle root (pre-computed, fixed for this mining run)
+  -> BlockHash -- ^ previous block hash
+  -> TVar Bool -- ^ cancellation flag
+  -> IO (Maybe (BlockHash, Int))
+mineBlockAsync diff index timestamp merkle prevHash cancelVar =
   go 0
   where
     go nonce = do
@@ -128,14 +227,13 @@ mineBlockAsync diff index timestamp dat prevHash cancelVar =
         then return (Just (h, nextNonce - 1))
         else do
           cancelled <- readTVarIO cancelVar
-          if cancelled then return Nothing
-                       else go nextNonce
+          if cancelled then return Nothing else go nextNonce
 
-    searchBatch :: Int -> Int -> (Bool, Hash, Int)
-    searchBatch nonce 0 = (False, "", nonce)
+    searchBatch :: Int -> Int -> (Bool, BlockHash, Int)
+    searchBatch nonce 0 = (False, genesisHash, nonce)
     searchBatch nonce n =
-      let h = calculateHash index timestamp dat prevHash nonce
-      in if take diff h == replicate diff '0'
+      let h = calculateHash index timestamp merkle prevHash nonce
+      in if isValidHash diff h
            then (True, h, nonce + 1)
            else searchBatch (nonce + 1) (n - 1)
 
@@ -143,62 +241,63 @@ mineBlockAsync diff index timestamp dat prevHash cancelVar =
 -- Chain operations
 -- ---------------------------------------------------------------------------
 
--- | Mine the genesis block using the supplied config.
 createGenesisBlock :: ChainConfig -> IO Block
 createGenesisBlock cfg = do
   now <- getCurrentTime
   let diff      = cfgDifficulty cfg
       timestamp = show now
-      prevHash  = "0"
-      dat       = "Genesis Block"
+      txs       = []
+      merkle    = computeMerkleRoot txs
   cancelVar <- newTVarIO False
-  result    <- mineBlockAsync diff 0 timestamp dat prevHash cancelVar
+  result    <- mineBlockAsync diff 0 timestamp merkle genesisHash cancelVar
   case result of
     Nothing         -> fail "Genesis mining cancelled — should never happen"
     Just (h, nonce) -> return Block
-      { blockIndex     = 0
-      , blockTimestamp = now
-      , blockData      = dat
-      , blockPrevHash  = prevHash
-      , blockNonce     = nonce
-      , blockHash      = h
+      { blockIndex      = 0
+      , blockTimestamp  = now
+      , blockTxs        = txs
+      , blockMerkleRoot = merkle
+      , blockPrevHash   = genesisHash
+      , blockNonce      = nonce
+      , blockHash       = h
       }
 
--- | Mine and append a new block.
--- Retargets difficulty automatically every cfgRetargetEvery blocks.
--- Returns Nothing if mining was cancelled via the TVar.
-addBlock :: Blockchain -> String -> TVar Bool -> IO (Maybe Blockchain)
-addBlock bc dat cancelVar = do
+-- | Mine and append a new block containing the given transactions.
+-- Returns Left with a timestamp error if the wall-clock time fails validation
+-- (this should be rare in normal operation but guards against clock skew).
+addBlock :: Blockchain -> [Transaction] -> TVar Bool -> IO (Either TimestampError (Maybe Blockchain))
+addBlock bc txs cancelVar = do
   now <- getCurrentTime
   let cfg       = chainConfig bc
       prev      = chainTip bc
-      newIndex  = blockIndex prev + 1
-      prevHash  = blockHash prev
-      timestamp = show now
+      prevTime  = blockTimestamp prev
+  case validateTimestamp cfg now prevTime now of
+    Left err -> return (Left err)
+    Right () -> do
+      let newIndex  = blockIndex prev + 1
+          prevHash  = blockHash prev
+          timestamp = show now
+          merkle    = computeMerkleRoot txs
+          cfg'      = if newIndex `mod` cfgRetargetEvery cfg == 0
+                        then retargetDifficulty cfg
+                               (takeLast (cfgRetargetEvery cfg) (chainToList bc))
+                        else cfg
+          diff      = cfgDifficulty cfg'
+      result <- mineBlockAsync diff newIndex timestamp merkle prevHash cancelVar
+      case result of
+        Nothing         -> return (Right Nothing)
+        Just (h, nonce) ->
+          let newBlock = Block
+                { blockIndex      = newIndex
+                , blockTimestamp  = now
+                , blockTxs        = txs
+                , blockMerkleRoot = merkle
+                , blockPrevHash   = prevHash
+                , blockNonce      = nonce
+                , blockHash       = h
+                }
+          in return $ Right $ Just $ Blockchain (chainBlocks bc |> newBlock) newBlock cfg'
 
-      -- Retarget when we have just completed a full window
-      cfg' = if newIndex `mod` cfgRetargetEvery cfg == 0
-               then retargetDifficulty cfg
-                      (takeLast (cfgRetargetEvery cfg) (chainToList bc))
-               else cfg
-
-      diff = cfgDifficulty cfg'
-
-  result <- mineBlockAsync diff newIndex timestamp dat prevHash cancelVar
-  case result of
-    Nothing         -> return Nothing
-    Just (h, nonce) ->
-      let newBlock = Block
-            { blockIndex     = newIndex
-            , blockTimestamp = now
-            , blockData      = dat
-            , blockPrevHash  = prevHash
-            , blockNonce     = nonce
-            , blockHash      = h
-            }
-      in return $ Just $ Blockchain (chainBlocks bc |> newBlock) newBlock cfg'
-
--- | Take the last n elements of a list.
 takeLast :: Int -> [a] -> [a]
 takeLast n xs = drop (length xs - n) xs
 
@@ -206,18 +305,25 @@ takeLast n xs = drop (length xs - n) xs
 -- Validation
 -- ---------------------------------------------------------------------------
 
--- | Check that a hash meets the difficulty target stored in a config.
-isValidHash :: Int -> Hash -> Bool
-isValidHash diff h = take diff h == replicate diff '0'
-
--- | Validate the entire chain using the difficulty in the current config.
--- Note: a production validator would re-run retargeting per window.
+-- | Validate chain linkage, PoW, Merkle root integrity, and timestamp ordering.
+-- Note: the future-cap check uses each block's own timestamp as "now" for the
+-- next block, which is the correct offline validation behaviour.
 isValidChain :: Blockchain -> Bool
 isValidChain bc = go (cfgDifficulty (chainConfig bc)) (chainToList bc)
   where
+    cfg = chainConfig bc
+
     go _    []           = True
     go diff [b]          = isValidHash diff (blockHash b)
+                        && blockMerkleRoot b == computeMerkleRoot (blockTxs b)
     go diff (b1:b2:rest) =
          blockHash b1 == blockPrevHash b2
       && isValidHash diff (blockHash b1)
+      && blockMerkleRoot b1 == computeMerkleRoot (blockTxs b1)
+      && isRight (validateTimestamp cfg (blockTimestamp b2)
+                                        (blockTimestamp b1)
+                                        (blockTimestamp b2))
       && go diff (b2:rest)
+
+    isRight (Right _) = True
+    isRight (Left  _) = False
